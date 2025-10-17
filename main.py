@@ -94,17 +94,61 @@ def safe_makedirs(path: str):
     os.makedirs(path, exist_ok=True)
 
 def remove_local_path(path: str):
+    """Remove a directory with Windows-compatible retry logic."""
     if not os.path.exists(path):
         return
+    
+    import time
+    import gc
+    
     def onerror(func, path_arg, exc_info):
+        """Error handler that attempts to change file permissions."""
         try:
-            os.chmod(path_arg, stat.S_IWUSR)
+            os.chmod(path_arg, stat.S_IWUSR | stat.S_IWRITE)
             func(path_arg)
-        except Exception as exc:
-            logger.exception(f"Failed in rmtree on {path_arg}: {exc}")
-            raise
+        except Exception:
+            pass  # Silently continue, will retry
+    
     logger.info(f"[CLEANUP] Removing local directory: {path}")
-    shutil.rmtree(path, onerror=onerror)
+    
+    # Attempt cleanup with retries
+    max_retries = 5
+    retry_delay = 0.5  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            # Force garbage collection to close any open file handles
+            gc.collect()
+            
+            # On Windows, try to close any git repository handles first
+            if os.path.exists(os.path.join(path, '.git')):
+                try:
+                    repo = git.Repo(path)
+                    repo.close()
+                    del repo
+                    gc.collect()
+                except Exception:
+                    pass
+            
+            # Attempt removal
+            shutil.rmtree(path, onerror=onerror)
+            logger.info(f"[CLEANUP] Successfully removed {path}")
+            flush_logs()
+            return
+            
+        except PermissionError as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"[CLEANUP] Attempt {attempt + 1}/{max_retries} failed for {path}. Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger.error(f"[CLEANUP] Failed to remove {path} after {max_retries} attempts. Continuing anyway.")
+                # Don't raise - allow the process to continue
+                break
+        except Exception as e:
+            logger.exception(f"[CLEANUP] Unexpected error removing {path}: {e}")
+            break
+    
     flush_logs()
 
 # ------------------------- Attachment helpers -------------------------
@@ -211,10 +255,22 @@ async def setup_local_repo(local_path: str, repo_name: str, repo_url_auth: str, 
                 logger.info(f"[GIT] R1: Creating remote repo '{repo_name}'")
                 payload = {"name": repo_name, "private": False, "auto_init": True}
                 resp = await client.post(f"{settings.GITHUB_API_BASE}/user/repos", json=payload, headers=headers)
-                resp.raise_for_status()
-                repo = git.Repo.init(local_path)
-                repo.create_remote('origin', repo_url_auth)
-                logger.info("[GIT] Local repo initialized")
+                
+                # Handle case where repository already exists
+                if resp.status_code == 422:
+                    response_text = resp.text
+                    if "name already exists" in response_text:
+                        logger.warning(f"[GIT] Repo '{repo_name}' already exists. Cloning instead...")
+                        # Clone existing repo instead
+                        repo = git.Repo.clone_from(repo_url_auth, local_path)
+                        logger.info("[GIT] Cloned existing repo")
+                    else:
+                        resp.raise_for_status()
+                else:
+                    resp.raise_for_status()
+                    repo = git.Repo.init(local_path)
+                    repo.create_remote('origin', repo_url_auth)
+                    logger.info("[GIT] Local repo initialized")
             else:
                 logger.info(f"[GIT] R{round_index}: Cloning {repo_url_http}")
                 repo = git.Repo.clone_from(repo_url_auth, local_path)
@@ -415,6 +471,7 @@ async def notify_evaluation_server(evaluation_url: str, email: str, task_id: str
 # ------------------------- Main orchestration -------------------------
 async def generate_files_and_deploy(task_data: TaskRequest):
     acquired = False
+    repo = None  # Track repo to ensure proper cleanup
     try:
         await task_semaphore.acquire()
         acquired = True
@@ -444,7 +501,7 @@ async def generate_files_and_deploy(task_data: TaskRequest):
                 remove_local_path(local_path)
             except Exception as e:
                 logger.exception(f"Cleanup failed for {local_path}: {e}")
-                raise
+                # Continue anyway - the updated remove_local_path won't raise
         safe_makedirs(local_path)
 
         # Setup repo (init or clone)
@@ -562,6 +619,14 @@ async def generate_files_and_deploy(task_data: TaskRequest):
     except Exception as exc:
         logger.exception(f"[CRITICAL FAILURE] Task {getattr(task_data, 'task', 'unknown')} failed: {exc}")
     finally:
+        # Close git repository to release file handles
+        if repo is not None:
+            try:
+                repo.close()
+                logger.info("[GIT] Repository closed")
+            except Exception as e:
+                logger.warning(f"[GIT] Error closing repository: {e}")
+        
         if acquired:
             task_semaphore.release()
         flush_logs()

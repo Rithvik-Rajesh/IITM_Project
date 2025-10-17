@@ -2,3 +2,5 @@
 .env
 .venv
 json-post-requests.txt
+__pycache__/
+logs/app.log
